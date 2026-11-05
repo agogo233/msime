@@ -1,0 +1,318 @@
+# 云 CI：构建 Windows x64 安装包（full 版）并上传扁平 artifact。
+# 一次共享构建，两种暂存：基础版（core）与带全部可选资源的完整版（full）；
+# 两个打包 job 只做 Inno 编译、装卸验收和上传，不重复编译。
+# 关键命令对照 release-windows.yml 的已验证写法；其余流水线全部停用（*.yml.bak），
+# 仓库当前唯一生效的 Actions 工作流是本文件。
+name: Cloud CI Windows x64
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+# 同分支的新推送取消旧运行，避免排队堆机器。
+concurrency:
+  group: cloud-ci-windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+# Windows 上 Python 默认按 ANSI 代码页解码文本，抓取和打包脚本读 UTF-8 源。
+env:
+  PYTHONUTF8: '1'
+  VCPKG_DISABLE_METRICS: '1'
+  CARGO_INCREMENTAL: '0'
+  SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      # GitHub 托管 runner：sccache 走 GitHub Actions 缓存，重复推送时省去整棵 Rust 依赖树的重编。
+      SCCACHE_GHA_ENABLED: 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = (Get-Content platforms/windows/version.txt -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "invalid version: $v" }
+          "value=$v" >> $env:GITHUB_OUTPUT
+          # vcpkg 缓存键：清单内容哈希加固定基线，两者任一变化才重新装依赖。
+          $baseline = (Get-Content platforms/windows/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          "vcpkg-baseline=$baseline" >> $env:GITHUB_OUTPUT
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Enable sccache
+        if: ${{ steps.sccache.outcome == 'success' }}
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache did not start; the Rust build runs without the compile cache"
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: {node-version: 24}
+      # 从 package.json 的 packageManager 读 pnpm 版本。
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Install Rust toolchain and targets
+        # 带网络重试；wasm 目标给官方插件包，arm64 目标给 Arm64X TIP 的宿主 DLL。
+        run: bash scripts/rustup-install.sh x86_64-pc-windows-msvc i686-pc-windows-msvc aarch64-pc-windows-msvc wasm32-unknown-unknown
+      # 两个 prefix 各自装 vcpkg 清单：x64 给 Server、看门狗和 64 位 TSF，x86 给 32 位 TSF。
+      - id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/msime-deps
+          key: windows-deps-${{ hashFiles('platforms/windows/vcpkg.json') }}-${{ steps.version.outputs.vcpkg-baseline }}
+      - name: Install native dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        env: {BASELINE: "${{ steps.version.outputs.vcpkg-baseline }}"}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vcpkg = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone --quiet --filter=blob:none https://github.com/microsoft/vcpkg.git $vcpkg
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg clone failed' }
+          git -C $vcpkg checkout --quiet $env:BASELINE
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg baseline checkout failed' }
+          & (Join-Path $vcpkg 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          foreach ($triplet in @('x64-windows', 'x86-windows')) {
+            & (Join-Path $vcpkg 'vcpkg.exe') install --triplet $triplet --x-manifest-root=platforms/windows "--x-install-root=$(Join-Path $env:RUNNER_TEMP "msime-deps/$triplet")"
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed for $triplet" }
+          }
+      # 失败也保留已装依赖供重跑。
+      - if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/msime-deps
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+      - name: Download desktop resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 抓取并校验 resources/desktop-dictionary.lock.json 钉住的桌面词库文件。
+          # 例程把文件落到 <传入目录>/<generation>/,打印最后一行才是真实目录(对照 release-windows.yml)。
+          $root = Join-Path (Get-Location) 'target/desktop-resources'
+          $resources = @(& cargo run --quiet --locked -p msime-client-core --example install_resources -- $root)
+          if ($LASTEXITCODE -ne 0) { throw 'desktop resource download failed' }
+          $dest = @($resources)[-1].Trim()
+          if (-not (Test-Path -LiteralPath $dest -PathType Container)) { throw "desktop resources missing: $dest" }
+          "MSIME_DESKTOP_RESOURCES=$dest" >> $env:GITHUB_ENV
+      - name: Build Windows client
+        shell: pwsh
+        env: {VERSION: "${{ steps.version.outputs.value }}"}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $deps = Join-Path $env:RUNNER_TEMP 'msime-deps'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          # runner 镜像在 Visual Studio 版本间漂移，生成器名字从 CMake 自己的清单里取。
+          $major = ([version](& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion)).Major
+          $generator = @(cmake --help | Select-String -Pattern "Visual Studio $major \d{4}" -AllMatches | ForEach-Object { $_.Matches.Value } | Select-Object -Unique)
+          if ($generator.Count -ne 1) { throw "no single CMake generator for Visual Studio $major" }
+          $generator = $generator[0]
+          Write-Output "CMake generator: $generator"
+          # clang（arm64 的 ring 汇编、Arm64X 链接）、MSBuild（WinUI 3 设置窗口）、lib（导入库）都不在 runner 的默认 PATH 上，从 Visual Studio 安装里取出来。
+          $clang = @(& $vswhere -latest -products * -find 'VC\Tools\Llvm\x64\bin\clang.exe')
+          if ($clang.Count -lt 1) { throw 'no clang in the Visual Studio installation' }
+          $env:PATH = "$(Split-Path -Parent $clang[0]);$env:PATH"
+          $msbuild = @(& $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe')
+          if ($msbuild.Count -lt 1) { throw 'no MSBuild in the Visual Studio installation' }
+          $env:PATH = "$(Split-Path -Parent $msbuild[0]);$env:PATH"
+          $lib = @(& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\lib.exe')
+          if ($lib.Count -lt 1) { throw 'no lib.exe in the Visual Studio installation' }
+          $env:PATH = "$(Split-Path -Parent $lib[-1]);$env:PATH"
+          # Arm64X TIP 要 ARM64 和 ARM64EC 两套工具链，缺了就在深入构建前失败。
+          foreach ($component in 'Microsoft.VisualStudio.Component.VC.Tools.ARM64', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64EC') {
+            if (-not (& $vswhere -latest -products * -requires $component -property installationPath)) { throw "Visual Studio lacks $component" }
+          }
+          # 不传 -RustOutputs：脚本自己编 Rust 半（x64/x86/arm64 宿主 DLL、MCP server、Tauri 面板壳）。
+          # 云 CI 不打签名包，不启用 UIAccess。
+          ./platforms/windows/Build-Client.ps1 -X64Dependencies (Join-Path $deps 'x64-windows/x64-windows') -X86Dependencies (Join-Path $deps 'x86-windows/x86-windows') -TargetVersion $env:VERSION -Generator $generator -Edition full
+      - name: Collect third-party notices
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $deps = Join-Path $env:RUNNER_TEMP 'msime-deps'
+          # 云 CI 不收 Rust/npm 补充声明（正式发布才收）：缺了安装包照样完整，声明文件只含仓库随代码的声明和 vcpkg 条目。
+          ./platforms/windows/Collect-Notices.ps1 -DependencyPrefixes (Join-Path $deps 'x64-windows/x64-windows'), (Join-Path $deps 'x86-windows/x86-windows') -Edition full
+      # 先暂存基础版并取快照（此刻可选资源目录都还不存在），之后拉资源再重跑暂存（脚本对每个资源目标目录先清理再拷入，重跑幂等），取完整版快照。
+      - name: Stage base package files
+        shell: pwsh
+        env: {VERSION: "${{ steps.version.outputs.value }}"}
+        # MSIME_DESKTOP_RESOURCES 由 GITHUB_ENV 传播进来,无需在 env 里重复声明。
+        run: ./platforms/windows/installer/Prepare-PackageFiles.ps1 -TargetVersion $env:VERSION -Edition full -DesktopResourcesDirectory $env:MSIME_DESKTOP_RESOURCES
+      - name: Upload base staged inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msime-cloud-staged-base-windows-full-${{ steps.version.outputs.value }}
+          path: |
+            platforms/windows/installer/server_exe/
+            platforms/windows/installer/tsf_dll/
+            platforms/windows/installer/app_data/
+            platforms/windows/installer/MetasequoiaIME.ico
+            platforms/windows/installer/THIRD_PARTY_NOTICES.txt
+            platforms/windows/installer/LICENSE.txt
+            platforms/windows/installer/msime_setup.iss
+            !platforms/windows/installer/**/*.pdb
+            !platforms/windows/installer/**/*.ilk
+          if-no-files-found: error
+      - name: Build official plugin packs
+        # 插件只依赖路径依赖（msime-script-sdk），离线可建，不需要预热缓存。
+        run: bash scripts/build-official-plugins.sh
+      - name: Fetch optional resources
+        # 离线候选释义、英文释义/读音表、语言词库、背单词词书、逐键重排模型。
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/fetch_offline_glosses.py
+          python scripts/fetch_gloss_tables.py
+          python scripts/fetch_language_dictionaries.py
+          python scripts/fetch_wordbooks.py
+          python scripts/fetch_rerank_model.py
+      - name: Stage full package files
+        shell: pwsh
+        env:
+          VERSION: "${{ steps.version.outputs.value }}"
+          MSIME_REQUIRE_OFFICIAL_PLUGINS: '1'
+          MSIME_REQUIRE_WORDBOOKS: '1'
+          MSIME_REQUIRE_RERANK_MODELS: '1'
+        run: ./platforms/windows/installer/Prepare-PackageFiles.ps1 -TargetVersion $env:VERSION -Edition full -DesktopResourcesDirectory $env:MSIME_DESKTOP_RESOURCES
+      - name: Upload full staged inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msime-cloud-staged-full-windows-full-${{ steps.version.outputs.value }}
+          path: |
+            platforms/windows/installer/server_exe/
+            platforms/windows/installer/tsf_dll/
+            platforms/windows/installer/app_data/
+            platforms/windows/installer/MetasequoiaIME.ico
+            platforms/windows/installer/THIRD_PARTY_NOTICES.txt
+            platforms/windows/installer/LICENSE.txt
+            platforms/windows/installer/msime_setup.iss
+            !platforms/windows/installer/**/*.pdb
+            !platforms/windows/installer/**/*.ilk
+          if-no-files-found: error
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      # 打包 job 钉在同一个提交上，构建中途分支动了也不换源码。
+      commit: ${{ github.sha }}
+
+  package-core:
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: "${{ needs.build.outputs.commit }}", persist-credentials: false}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: msime-cloud-staged-base-windows-full-${{ needs.build.outputs.version }}
+          path: platforms/windows/installer
+      - name: Install Inno Setup and Chinese language file
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inno = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          if (-not (Test-Path -LiteralPath "$inno\ISCC.exe")) {
+            choco install innosetup --version 6.7.1 --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup install failed' }
+          }
+          # msime_setup.iss 用 compiler:Languages\ChineseSimplified.isl，Inno 官方不随包分发这份用户贡献翻译，按固定提交取并校验摘要。
+          $isl = "$inno\Languages\ChineseSimplified.isl"
+          if (-not (Test-Path -LiteralPath $isl)) {
+            Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/cfdf48923178df4b4f040e038b423aa555a61ffc/Files/Languages/Unofficial/ChineseSimplified.isl' -OutFile $isl
+            if ((Get-FileHash -LiteralPath $isl -Algorithm SHA256).Hash -ne '7D544B9BB1D142CFA11F2E5D3CC8ABE2E55F8E066C5124E3772675AA236E1278') { throw 'ChineseSimplified.isl digest mismatch' }
+          }
+      - name: Compile installer
+        shell: pwsh
+        run: ./platforms/windows/installer/Compile-Installer.ps1 -Edition full
+      - id: pkg
+        name: Collect installer and hash
+        shell: pwsh
+        env: {VERSION: "${{ needs.build.outputs.version }}"}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = (python platforms/windows/scripts/edition_windows.py field --edition full installer_base_name).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'edition installer name lookup failed' }
+          $name = "${base}_v$env:VERSION.exe"
+          $installer = "platforms/windows/installer/Output/$name"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw "installer missing: $installer" }
+          # 文件和它的摘要拷到工作区根，artifact 里就是文件本体，不带任何目录层。
+          Copy-Item -LiteralPath $installer -Destination .
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$name.sha256", "$hash  $name`n")
+          "name=$name" >> $env:GITHUB_OUTPUT
+          Get-ChildItem $name, "$name.sha256" | Format-Table Name, Length
+      - name: Upload installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msime-windows-x64-installer-core-${{ needs.build.outputs.version }}
+          path: |
+            ${{ steps.pkg.outputs.name }}
+            ${{ steps.pkg.outputs.name }}.sha256
+          if-no-files-found: error
+      # 先传后验：验收失败时安装包仍可取下来检查。
+      - name: Install and uninstall the package
+        shell: pwsh
+        run: ./platforms/windows/installer/tests/install-smoke.ps1 -Installer "${{ steps.pkg.outputs.name }}" -Edition full
+
+  package-full:
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: "${{ needs.build.outputs.commit }}", persist-credentials: false}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: msime-cloud-staged-full-windows-full-${{ needs.build.outputs.version }}
+          path: platforms/windows/installer
+      - name: Install Inno Setup and Chinese language file
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inno = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          if (-not (Test-Path -LiteralPath "$inno\ISCC.exe")) {
+            choco install innosetup --version 6.7.1 --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup install failed' }
+          }
+          $isl = "$inno\Languages\ChineseSimplified.isl"
+          if (-not (Test-Path -LiteralPath $isl)) {
+            Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/cfdf48923178df4b4f040e038b423aa555a61ffc/Files/Languages/Unofficial/ChineseSimplified.isl' -OutFile $isl
+            if ((Get-FileHash -LiteralPath $isl -Algorithm SHA256).Hash -ne '7D544B9BB1D142CFA11F2E5D3CC8ABE2E55F8E066C5124E3772675AA236E1278') { throw 'ChineseSimplified.isl digest mismatch' }
+          }
+      - name: Compile installer
+        shell: pwsh
+        run: ./platforms/windows/installer/Compile-Installer.ps1 -Edition full
+      - id: pkg
+        name: Collect installer and hash
+        shell: pwsh
+        env: {VERSION: "${{ needs.build.outputs.version }}"}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = (python platforms/windows/scripts/edition_windows.py field --edition full installer_base_name).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'edition installer name lookup failed' }
+          $name = "${base}_v$env:VERSION.exe"
+          $installer = "platforms/windows/installer/Output/$name"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw "installer missing: $installer" }
+          Copy-Item -LiteralPath $installer -Destination .
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$name.sha256", "$hash  $name`n")
+          "name=$name" >> $env:GITHUB_OUTPUT
+          Get-ChildItem $name, "$name.sha256" | Format-Table Name, Length
+      - name: Upload installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msime-windows-x64-installer-full-${{ needs.build.outputs.version }}
+          path: |
+            ${{ steps.pkg.outputs.name }}
+            ${{ steps.pkg.outputs.name }}.sha256
+          if-no-files-found: error
+      - name: Install and uninstall the package
+        shell: pwsh
+        run: ./platforms/windows/installer/tests/install-smoke.ps1 -Installer "${{ steps.pkg.outputs.name }}" -Edition full
